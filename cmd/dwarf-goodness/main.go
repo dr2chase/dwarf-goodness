@@ -8,6 +8,8 @@ import (
 	"debug/dwarf"
 	"fmt"
 	"github.com/dr2chase/dwarf-goodness/line_inputs"
+	"sort"
+
 	// "github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/proc"
 	"os"
@@ -41,8 +43,13 @@ type pcln struct {
 	present bool
 }
 
+type i2lkey struct {
+	file     string
+	variable string
+}
+
 type sortedLineMap struct {
-	m map[string][]*pcln
+	m map[i2lkey][]*pcln
 }
 
 var fileCache = map[string]*sortedLineMap{}
@@ -52,22 +59,37 @@ func getFile(bi *proc.BinaryInfo, path string) *sortedLineMap {
 		return r
 	}
 	line2inputs := line_inputs.ReadFile(path)
+
 	sortedLines := line_inputs.SortDomain(line2inputs)
-	input2Lines := make(map[string][]*pcln)
+
+	input2Lines := make(map[i2lkey][]*pcln)
+
+	line2pcs := bi.AllPCsForFileLines(path, sortedLines)
+
 	for _, line := range sortedLines {
 		inputs := line2inputs[line]
-		for _, input := range inputs.Inputs() {
-			pclns := input2Lines[input]
-			for _, pc := range bi.AllPCsForFileLine(path, line) {
+		k := i2lkey{file: path}
+		for _, pc := range line2pcs[line] {
+			for _, input := range inputs.Inputs() {
+				k.variable = input
+				pclns := input2Lines[k]
 				pclns = append(pclns, &pcln{file: path, line: line, name: input, pc: pc})
+				input2Lines[k] = pclns
 			}
-			input2Lines[input] = pclns
 		}
+	}
+	// Sort the input locations by PC to allow faster checking later.
+	for _, v := range input2Lines {
+		sort.Slice(v, func(i, j int) bool { // less
+			return v[i].pc < v[j].pc
+		})
 	}
 	r := &sortedLineMap{m: input2Lines}
 	fileCache[path] = r
 	return r
 }
+
+var file0 string
 
 func main() {
 	bi := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
@@ -86,10 +108,21 @@ func main() {
 			continue
 		}
 
+		if file != file0 {
+			_, _ = fmt.Fprintf(os.Stderr, "\n")
+		}
 		input2Lines := getFile(bi, file)
 		if input2Lines.m == nil {
-			fmt.Printf("Couldn't read source file %s\n", file)
+			_, _ = fmt.Fprintf(os.Stderr, "Couldn't read source file %s\n", file)
+			continue
 		}
+
+		if file != file0 {
+			_, _ = fmt.Fprintf(os.Stderr, "File %s: ", file)
+			file0 = file
+		}
+
+		_, _ = fmt.Fprintf(os.Stderr, ".")
 
 		_fn := (*Function)(unsafe.Pointer(&fn))
 
@@ -122,23 +155,47 @@ func main() {
 			}
 			seen[name] = true
 
-			pclns := input2Lines.m[name]
+			pclns := input2Lines.m[i2lkey{file: file, variable: name}]
 			if len(pclns) == 0 {
 				continue
 			}
 
 			pairs, err := bi.LocationCovers(e, dwarf.AttrLocation)
+			if len(pairs) == 0 {
+				continue
+			}
 
-			for _, pcln := range pclns {
-				for _, p := range pairs {
-					fmt.Printf("p[0] = 0x%x, pcln.pc=0x%x, p[1] = 0x%x, \n", p[0], pcln.pc, p[1])
-					if p[0] <= pcln.pc && pcln.pc <= p[1] {
-						pcln.present = true
+			sort.Slice(pairs, func(i, j int) bool { // less
+				return pairs[i][0] < pairs[j][0]
+			})
+
+			i, j := 0, 0
+			pcln := pclns[i]
+			p := pairs[j]
+
+			for {
+				if pcln.pc > p[1] {
+					j++
+					if j >= len(pairs) {
+						break
 					}
+					p = pairs[j]
+					continue
 				}
+				if p[0] <= pcln.pc && pcln.pc <= p[1] {
+					pcln.present = true
+				}
+				i++
+				if i >= len(pclns) {
+					break
+				}
+				pcln = pclns[i]
 			}
 		}
 	}
+	_, _ = fmt.Fprintf(os.Stderr, "\n")
+	_, _ = fmt.Fprintf(os.Stderr, "\n")
+
 	// Report the contents of the file Cache
 	total := 0
 	present := 0
