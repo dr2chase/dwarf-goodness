@@ -92,6 +92,7 @@ func getFile(bi *proc.BinaryInfo, path string) *sortedLineMap {
 var file0 string
 
 func main() {
+	debug := false
 	bi := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
 	bi.LoadBinaryInfo(os.Args[1], 0, []string{})
 
@@ -108,7 +109,7 @@ func main() {
 			continue
 		}
 
-		if file != file0 {
+		if file != file0 && debug {
 			_, _ = fmt.Fprintf(os.Stderr, "\n")
 		}
 		input2Lines := getFile(bi, file)
@@ -118,11 +119,15 @@ func main() {
 		}
 
 		if file != file0 {
-			_, _ = fmt.Fprintf(os.Stderr, "File %s: ", file)
+			if debug {
+				_, _ = fmt.Fprintf(os.Stderr, "File %s: ", file)
+			}
 			file0 = file
 		}
 
-		_, _ = fmt.Fprintf(os.Stderr, ".")
+		if debug {
+			_, _ = fmt.Fprintf(os.Stderr, ".")
+		}
 
 		_fn := (*Function)(unsafe.Pointer(&fn))
 
@@ -193,8 +198,11 @@ func main() {
 			}
 		}
 	}
-	_, _ = fmt.Fprintf(os.Stderr, "\n")
-	_, _ = fmt.Fprintf(os.Stderr, "\n")
+
+	if debug {
+		_, _ = fmt.Fprintf(os.Stderr, "\n")
+		_, _ = fmt.Fprintf(os.Stderr, "\n")
+	}
 
 	// Report the contents of the file Cache
 	total := 0
@@ -209,7 +217,7 @@ func main() {
 				}
 			}
 			if npresent != ninput {
-				fmt.Printf("%s,%s,%d,%d\n", fname, vname, ninput, npresent)
+				fmt.Printf("%s,%s,%d,%d\n", fname, vname.variable, ninput, npresent)
 			}
 			total += ninput
 			present += npresent
