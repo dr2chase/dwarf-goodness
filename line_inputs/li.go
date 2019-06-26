@@ -10,11 +10,45 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"sort"
+	"strings"
 )
 
-var notfset *token.FileSet
+type StmtAndInputs struct {
+	inputs      []string
+	hasCall     bool
+	hasTwoParts bool // for loops may have two parts if they have either test or increment.
+	NumberOfPCs int  // record how many times a file/line combo appears in the generated code.
+	file	    string
+	line        int
+}
 
-func ReadFile(fileName string) (linesToInputs map[int][]string) {
+func (s *StmtAndInputs) Inputs() []string {
+	return s.inputs
+}
+func (s *StmtAndInputs) HasCall() bool {
+	return s.hasCall
+}
+func (s *StmtAndInputs) HasTwoParts() bool {
+	return s.hasTwoParts
+}
+
+func SortDomain(linesToInputs map[int]*StmtAndInputs) []int {
+	var lines []int
+	if linesToInputs == nil {
+		return lines
+	}
+	for line := range linesToInputs {
+		lines = append(lines, line)
+	}
+	sort.Ints(lines)
+	return lines
+}
+
+func ReadFile(fileName string) (linesToInputs map[int]*StmtAndInputs) {
+	if ! strings.HasSuffix(fileName, ".go") {
+		return
+	}
 	fset := token.NewFileSet() // positions are relative to fset
 
 	f, err := parser.ParseFile(fset, fileName, nil, parser.ParseComments)
@@ -44,6 +78,11 @@ func ReadFile(fileName string) (linesToInputs map[int][]string) {
 	}
 	_ = positionFor
 
+	linesToInputs = make(map[int]*StmtAndInputs)
+
+	funcLow := math.MaxInt32
+	funcHigh := 0
+
 	var myFunc func(n ast.Node, isAssignmentContext bool) bool
 
 	asValue := func(n ast.Node) bool {
@@ -53,16 +92,12 @@ func ReadFile(fileName string) (linesToInputs map[int][]string) {
 		return myFunc(n, true)
 	}
 
-	linesToInputs = make(map[int][]string)
-
-	funcLow := math.MaxInt32
-	funcHigh := 0
-
 	myFunc = func(n ast.Node, isAssignmentContext bool) bool {
 		if n == nil {
 			return true
 		}
 
+	outerswitch:
 		switch n := n.(type) {
 		case *ast.Ident:
 			if !isAssignmentContext {
@@ -73,8 +108,17 @@ func ReadFile(fileName string) (linesToInputs map[int][]string) {
 					//fmt.Printf("Ident, name=%s, file=%s, line=%d, decl line=%d, decl=%T\n",
 					//	n.Name, pos.Filename, pos.Line, declPos.Line, obj.Decl)
 					if funcLow <= declPos.Line && declPos.Line <= funcHigh {
-						i := linesToInputs[pos.Line]
-						linesToInputs[pos.Line] = append(i, n.Name)
+						x := linesToInputs[pos.Line]
+						if x == nil {
+							x = &StmtAndInputs{file:fileName, line:pos.Line}
+							linesToInputs[pos.Line] = x
+						}
+						for _, y := range x.inputs { // linear search, but lines are short(ish).
+							if y == n.Name {
+								break outerswitch
+							}
+						}
+						x.inputs = append(x.inputs, n.Name)
 					}
 				}
 			}
@@ -90,7 +134,35 @@ func ReadFile(fileName string) (linesToInputs map[int][]string) {
 
 		case *ast.RangeStmt:
 			ast.Inspect(n.X, asValue)
+			ast.Inspect(n.Body, asValue)
 			return false
+
+		case *ast.CallExpr:
+			if fn, ok := n.Fun.(*ast.Ident); ok {
+				// Exclude the not-real-calls
+				switch fn.Name {
+				case "len", "append", "make", "new", "panic":
+					break outerswitch
+				}
+			}
+			pos := fset.Position(n.Pos())
+			x := linesToInputs[pos.Line]
+			if x == nil {
+				x = &StmtAndInputs{file:fileName, line:pos.Line}
+				linesToInputs[pos.Line] = x
+			}
+			x.hasCall = true
+
+		case *ast.ForStmt:
+			pos := fset.Position(n.Pos())
+			if n.Post != nil { // post stmt is a second statement, maybe
+				x := linesToInputs[pos.Line]
+				if x == nil {
+					x = &StmtAndInputs{file:fileName, line:pos.Line}
+					linesToInputs[pos.Line] = x
+				}
+				x.hasTwoParts = true
+			}
 
 		case *ast.ValueSpec:
 			for _, rhs := range n.Values {
@@ -116,9 +188,11 @@ func ReadFile(fileName string) (linesToInputs map[int][]string) {
 		case *ast.FuncDecl:
 			// Skip parameters and returns.
 			savedFL, savedFH := funcLow, funcHigh
-			funcLow, funcHigh = fset.Position(n.Pos()).Line, fset.Position(n.End()).Line
-			ast.Inspect(n.Body, asValue)
-			funcLow, funcHigh = savedFL, savedFH
+			if n.Body != nil {
+				funcLow, funcHigh = fset.Position(n.Pos()).Line, fset.Position(n.End()).Line
+				ast.Inspect(n.Body, asValue)
+				funcLow, funcHigh = savedFL, savedFH
+			}
 			return false
 		case *ast.FuncLit:
 			// Skip parameters and returns.
