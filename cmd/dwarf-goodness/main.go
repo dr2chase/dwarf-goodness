@@ -7,20 +7,14 @@ package main
 import (
 	"debug/dwarf"
 	"fmt"
-	"github.com/dr2chase/dwarf-goodness/line_inputs"
-	"sort"
-
-	// "github.com/go-delve/delve/pkg/dwarf/op"
-	"github.com/go-delve/delve/pkg/proc"
 	"os"
 	"runtime"
+	"sort"
 	"unsafe"
-)
 
-//go:noinline
-func id(x int) int {
-	return x
-}
+	"github.com/dr2chase/dwarf-goodness/line_inputs"
+	"github.com/go-delve/delve/pkg/proc"
+)
 
 func must(err error) {
 	if err != nil {
