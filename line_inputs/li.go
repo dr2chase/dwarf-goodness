@@ -19,7 +19,7 @@ type StmtAndInputs struct {
 	hasCall     bool
 	hasTwoParts bool // for loops may have two parts if they have either test or increment.
 	NumberOfPCs int  // record how many times a file/line combo appears in the generated code.
-	file	    string
+	file        string
 	line        int
 }
 
@@ -46,7 +46,7 @@ func SortDomain(linesToInputs map[int]*StmtAndInputs) []int {
 }
 
 func ReadFile(fileName string) (linesToInputs map[int]*StmtAndInputs) {
-	if ! strings.HasSuffix(fileName, ".go") {
+	if !strings.HasSuffix(fileName, ".go") {
 		return
 	}
 	fset := token.NewFileSet() // positions are relative to fset
@@ -110,7 +110,7 @@ func ReadFile(fileName string) (linesToInputs map[int]*StmtAndInputs) {
 					if funcLow <= declPos.Line && declPos.Line <= funcHigh {
 						x := linesToInputs[pos.Line]
 						if x == nil {
-							x = &StmtAndInputs{file:fileName, line:pos.Line}
+							x = &StmtAndInputs{file: fileName, line: pos.Line}
 							linesToInputs[pos.Line] = x
 						}
 						for _, y := range x.inputs { // linear search, but lines are short(ish).
@@ -148,7 +148,7 @@ func ReadFile(fileName string) (linesToInputs map[int]*StmtAndInputs) {
 			pos := fset.Position(n.Pos())
 			x := linesToInputs[pos.Line]
 			if x == nil {
-				x = &StmtAndInputs{file:fileName, line:pos.Line}
+				x = &StmtAndInputs{file: fileName, line: pos.Line}
 				linesToInputs[pos.Line] = x
 			}
 			x.hasCall = true
@@ -158,7 +158,7 @@ func ReadFile(fileName string) (linesToInputs map[int]*StmtAndInputs) {
 			if n.Post != nil { // post stmt is a second statement, maybe
 				x := linesToInputs[pos.Line]
 				if x == nil {
-					x = &StmtAndInputs{file:fileName, line:pos.Line}
+					x = &StmtAndInputs{file: fileName, line: pos.Line}
 					linesToInputs[pos.Line] = x
 				}
 				x.hasTwoParts = true

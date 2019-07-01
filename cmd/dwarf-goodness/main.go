@@ -6,12 +6,14 @@ package main
 
 import (
 	"debug/dwarf"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"unsafe"
 
 	"github.com/dr2chase/dwarf-goodness/line_inputs"
@@ -131,22 +133,174 @@ func (res *regexps) IsBoolFlag() bool {
 	return false
 }
 
+type key struct {
+	compare      func(x, y *summaryRecord) int
+	appendString func(x *summaryRecord, s []string) []string
+	copyField    func(from, to *summaryKey)
+	name         string
+	active       bool
+}
+
+func (x *key) IsBoolFlag() bool {
+	return true
+}
+
+func (x *key) String() string {
+	if x.active {
+		return x.name
+	}
+	return "false"
+}
+
+var keys []*key
+
+func (x *key) Set(s string) error {
+	keys = append(keys, x)
+	return nil
+}
+
+func compare(x, y int) int {
+	if x < y {
+		return -1
+	}
+	if x > y {
+		return 1
+	}
+	return 0
+}
+func appendStringNop(x *summaryRecord, s []string) []string {
+	return s
+}
+func copyFieldNop(from, to *summaryKey) {
+}
+
 func main() {
 	debug := false
-	byFile := false
-	byFunc := false
-	byVar := false
-	byLine := false
 
 	var files []*regexp.Regexp
 	var funcs []*regexp.Regexp
 	var vars []*regexp.Regexp
 
+	var byFile = key{
+		name: "by file",
+		compare: func(x, y *summaryRecord) int {
+			return strings.Compare(x.byFile, y.byFile)
+		},
+		appendString: func(x *summaryRecord, s []string) []string {
+			return append(s, x.byFile)
+		},
+		copyField: func(from, to *summaryKey) {
+			to.byFile = from.byFile
+		},
+	}
+	var byFunc = key{
+		name: "by func",
+		compare: func(x, y *summaryRecord) int {
+			return strings.Compare(x.byFunc, y.byFunc)
+		},
+		appendString: func(x *summaryRecord, s []string) []string {
+			return append(s, x.byFunc)
+		},
+		copyField: func(from, to *summaryKey) {
+			to.byFunc = from.byFunc
+		},
+	}
+	var byVar = key{
+		name: "by var",
+		compare: func(x, y *summaryRecord) int {
+			return strings.Compare(x.byVar, y.byVar)
+		},
+		appendString: func(x *summaryRecord, s []string) []string {
+			return append(s, x.byVar)
+		},
+		copyField: func(from, to *summaryKey) {
+			to.byVar = from.byVar
+		},
+	}
+	var byLine = key{
+		name: "by line",
+		compare: func(x, y *summaryRecord) int {
+			return compare(x.byLine, y.byLine)
+		},
+		appendString: func(x *summaryRecord, s []string) []string {
+			return s
+		},
+		copyField: func(from, to *summaryKey) {
+		},
+	}
+
+	var byPresent = key{
+		name: "by present",
+		compare: func(x, y *summaryRecord) int {
+			return compare(x.present, y.present)
+		},
+		appendString: appendStringNop,
+		copyField:    copyFieldNop,
+	}
+
+	var byTotal = key{
+		name: "by total",
+		compare: func(x, y *summaryRecord) int {
+			return compare(x.total, y.total)
+		},
+		appendString: appendStringNop,
+		copyField:    copyFieldNop,
+	}
+
+	// Quality is present/total.
+	var byQuality = key{
+		name: "by quality",
+		compare: func(x, y *summaryRecord) int {
+			if x.total == 0 && y.total != 0 {
+				return -1
+			}
+			if y.total == 0 && x.total != 0 {
+				return 1
+			}
+			if x.total == 0 && y.total == 0 {
+				return 0
+			}
+			qx := float64(x.present) / float64(x.total)
+			qy := float64(y.present) / float64(y.total)
+			if qx < qy {
+				return -1
+			}
+			if qx > qy {
+				return 1
+			}
+			return 0
+		},
+		appendString: appendStringNop,
+		copyField:    copyFieldNop,
+	}
+
+	// Badness is total - present.
+	var byBadness = key{
+		name: "by badness",
+		compare: func(x, y *summaryRecord) int {
+			qx := x.total - x.present
+			qy := y.total - y.present
+			if qx < qy {
+				return -1
+			}
+			if qx > qy {
+				return 1
+			}
+			return 0
+		},
+		appendString: appendStringNop,
+		copyField:    copyFieldNop,
+	}
+
 	flag.BoolVar(&debug, "debug", debug, "Emit (this program's) debugging output to stderr")
-	flag.BoolVar(&byFile, "byfile", byFile, "Split summary by file")
-	flag.BoolVar(&byFunc, "byfunc", byFunc, "Split summary by functions")
-	flag.BoolVar(&byVar, "byvar", byVar, "Split summary by variables")
-	flag.BoolVar(&byLine, "byline", byLine, "Split summary by lines")
+	flag.Var(&byFile, "byfile", "Split summary and sort by file")
+	flag.Var(&byFunc, "byfunc", "Split summary and sort by functions")
+	flag.Var(&byVar, "byvar", "Split summary and sort by variables")
+	flag.Var(&byLine, "byline", "Split summary and sort by lines")
+	flag.Var(&byPresent, "bypresent", "Sort by how many inputs are present")
+	flag.Var(&byTotal, "bytotal", "Sort by total number of inputs")
+	flag.Var(&byQuality, "byquality", "Sort by present/total")
+	flag.Var(&byBadness, "bybadness", "Sort by total-present")
 
 	flag.Var((*regexps)(&files), "file", "Limit scan to files (pathnames) matching regexp (may be repeated)")
 	flag.Var((*regexps)(&funcs), "func", "Limit scan to functions matching regexp (may be repeated)")
@@ -159,14 +313,26 @@ func main() {
 For a binary, %s reports the number of local-variable inputs to lines
 that are present at that line's PC(s) in the debugging information,
 and for each summary line prints #inputs, #present, #present/#inputs.
-With no -byX options, it prints a single summary line.
+With no -byX options, it prints a single summary line, otherwise the
+output is split and sorted as specified (for sorting, parameter -byX
+parameter order matters).
+
+Example:
+ go tool -n compile | xargs ./dwarf-goodness \
+    -file=ssa/compile/internal/ssa \
+    -bybadness -bytotal -byfile -byvar
+
+This will report the files and variables in the ssa portion
+of the Go compiler, sorted by increasing badness (then total,
+then file, then variable).
+
 (There are still bugs in this reporting.)
 `, os.Args[0])
 	}
 
 	flag.Parse()
 
-	doit(flag.Arg(0), debug, byFile, byFunc, byLine, byVar, files, funcs, vars)
+	doit(flag.Arg(0), debug, keys, files, funcs, vars)
 }
 
 func skip(name string, res []*regexp.Regexp) bool {
@@ -181,7 +347,11 @@ func skip(name string, res []*regexp.Regexp) bool {
 	return true
 }
 
-func doit(binaryName string, debug, byFile, byFunc, byLine, byVar bool, files, funcs, vars []*regexp.Regexp) {
+// doit analyzes binaryName for "DWARF 	quality".
+// analysis is limited to the files/funcs/varts matching at least one of their respective slices of regular expressions,
+// and the report is split and sorted (or for results, just sorted) according to the ordered keys.
+// If debug is true, progress reports and perhaps debugging information appear on standard error.
+func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*regexp.Regexp) {
 	var file0 string
 
 	bi := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
@@ -311,23 +481,15 @@ func doit(binaryName string, debug, byFile, byFunc, byLine, byVar bool, files, f
 
 	summary := make(map[summaryKey]summaryValue)
 	// Summarize the contents of the file Cache
-	var key summaryKey
 	var total summaryRecord
 	for fname, slmap := range fileCache {
-		if byFile {
-			key.byFile = fname
-		}
 
 		for vname, pclns := range slmap.m {
-			if byVar {
-				key.byVar = vname.variable
-			}
 			for _, pcln := range pclns {
-				if byFunc {
-					key.byFunc = pcln.funcName
-				}
-				if byLine {
-					key.byLine = pcln.line
+				key0 := &summaryKey{byVar: vname.variable, byFile: fname, byFunc: pcln.funcName, byLine: pcln.line}
+				key := summaryKey{}
+				for _, k := range keys {
+					k.copyField(key0, &key)
 				}
 				value := summary[key]
 				value.total++
@@ -350,45 +512,37 @@ func doit(binaryName string, debug, byFile, byFunc, byLine, byVar bool, files, f
 	sort.Slice(ordered, func(i, j int) bool { // Less
 		oi := &ordered[i]
 		oj := &ordered[j]
-		if oi.byFile != oj.byFile {
-			return oi.byFile < oj.byFile
-		}
-		if oi.byFunc != oj.byFunc {
-			return oi.byFunc < oj.byFunc
-		}
-		if oi.byLine != oj.byLine {
-			return oi.byLine < oj.byLine
-		}
-		if oi.byVar != oj.byVar {
-			return oi.byVar < oj.byVar
+
+		for _, k := range keys {
+			c := k.compare(oi, oj)
+			if c != 0 {
+				return c < 0
+			}
 		}
 		return false // equal
 	})
 
-	describe := func(s string, record summaryRecord) {
-		fmt.Printf("%s%d, %d, %f\n", s, record.total, record.present, float64(record.present)/float64(record.total))
+	csvw := csv.NewWriter(os.Stdout)
+
+	describe := func(s []string, record summaryRecord) {
+		s = append(s, fmt.Sprintf("%d", record.total))
+		s = append(s, fmt.Sprintf("%d", record.present))
+		s = append(s, fmt.Sprintf("%f", float64(record.present)/float64(record.total)))
+		csvw.Write(s)
 	}
 
 	n := 0
 	for _, record := range ordered {
-		var s string
-		if byFile {
-			s = s + record.byFile + ", "
-		}
-		if byFunc {
-			s = s + record.byFunc + ", "
-		}
-		if byLine {
-			s = s + fmt.Sprintf("%d", record.byLine) + ", "
-		}
-		if byVar {
-			s = s + record.byVar + ", "
+		var s []string
+		for _, k := range keys {
+			s = k.appendString(&record, s)
 		}
 		n++
 		describe(s, record)
 	}
 	if n > 1 {
-		describe("total, ", total)
+		describe([]string{"total"}, total)
 	}
+	csvw.Flush()
 
 }
