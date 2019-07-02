@@ -26,6 +26,7 @@ func must(err error) {
 	}
 }
 
+// unsafe-punned to get access to private data from delve.
 type Function struct {
 	Name       string
 	Entry, End uint64 // same as DW_AT_lowpc and DW_AT_highpc
@@ -35,10 +36,10 @@ type Function struct {
 
 type pcln struct {
 	pc       uint64
+	line     int
 	fileName string
 	varName  string
 	funcName string
-	line     int
 	present  bool
 }
 
@@ -51,7 +52,7 @@ type summaryKey struct {
 
 type summaryValue struct {
 	present int
-	total   int
+	inputs   int
 }
 
 type summaryRecord struct {
@@ -59,32 +60,26 @@ type summaryRecord struct {
 	summaryValue
 }
 
-type i2lkey struct {
+type fileAndVar struct {
 	file     string
 	variable string
 }
 
-type sortedLineMap struct {
-	m map[i2lkey][]*pcln
-}
+type sortedLineMap map[fileAndVar][]*pcln
+var fileCache = make(map[string]sortedLineMap)
 
-var fileCache = map[string]*sortedLineMap{}
-
-func getFile(bi *proc.BinaryInfo, path string, skipVar func(name string) bool) *sortedLineMap {
+func getFile(bi *proc.BinaryInfo, path string, skipVar func(name string) bool) sortedLineMap {
 	if r, cached := fileCache[path]; cached {
 		return r
 	}
 	line2inputs := line_inputs.ReadFile(path)
-
 	sortedLines := line_inputs.SortDomain(line2inputs)
-
-	input2Lines := make(map[i2lkey][]*pcln)
-
 	line2pcs := bi.AllPCsForFileLines(path, sortedLines)
 
+	input2Lines := make(map[fileAndVar][]*pcln)
 	for _, line := range sortedLines {
 		inputs := line2inputs[line]
-		k := i2lkey{file: path}
+		k := fileAndVar{file: path}
 		for _, pc := range line2pcs[line] {
 			for _, input := range inputs.Inputs() {
 				if skipVar(input) {
@@ -103,11 +98,11 @@ func getFile(bi *proc.BinaryInfo, path string, skipVar func(name string) bool) *
 			return v[i].pc < v[j].pc
 		})
 	}
-	r := &sortedLineMap{m: input2Lines}
-	fileCache[path] = r
-	return r
+	fileCache[path] = input2Lines
+	return input2Lines
 }
 
+// For specifiying file, function, variables to report
 type regexps []*regexp.Regexp
 
 func (res *regexps) String() string {
@@ -133,30 +128,16 @@ func (res *regexps) IsBoolFlag() bool {
 	return false
 }
 
+// For specifying split and ordering of fields in the output
 type key struct {
+	name         string
 	compare      func(x, y *summaryRecord) int
 	appendString func(x *summaryRecord, s []string) []string
 	copyField    func(from, to *summaryKey)
-	name         string
-	active       bool
-}
-
-func (x *key) IsBoolFlag() bool {
-	return true
 }
 
 func (x *key) String() string {
-	if x.active {
-		return x.name
-	}
-	return "false"
-}
-
-var keys []*key
-
-func (x *key) Set(s string) error {
-	keys = append(keys, x)
-	return nil
+	return x.name
 }
 
 func compare(x, y int) int {
@@ -168,10 +149,181 @@ func compare(x, y int) int {
 	}
 	return 0
 }
-func appendStringNop(x *summaryRecord, s []string) []string {
-	return s
+
+func copyFieldNop(_, _ *summaryKey) {
 }
-func copyFieldNop(from, to *summaryKey) {
+
+var byFile = &key{
+	name: "file",
+	compare: func(x, y *summaryRecord) int {
+		return strings.Compare(x.byFile, y.byFile)
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, x.byFile)
+	},
+	copyField: func(from, to *summaryKey) {
+		to.byFile = from.byFile
+	},
+}
+var byFunc = &key{
+	name: "func",
+	compare: func(x, y *summaryRecord) int {
+		return strings.Compare(x.byFunc, y.byFunc)
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, x.byFunc)
+	},
+	copyField: func(from, to *summaryKey) {
+		to.byFunc = from.byFunc
+	},
+}
+var byVar = &key{
+	name: "var",
+	compare: func(x, y *summaryRecord) int {
+		return strings.Compare(x.byVar, y.byVar)
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, x.byVar)
+	},
+	copyField: func(from, to *summaryKey) {
+		to.byVar = from.byVar
+	},
+}
+var byLine = &key{
+	name: "line",
+	compare: func(x, y *summaryRecord) int {
+		return compare(x.byLine, y.byLine)
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, fmt.Sprintf("%d", x.byLine))
+	},
+	copyField: func(from, to *summaryKey) {
+		to.byLine = from.byLine
+	},
+}
+
+var byPresent = &key{
+	name: "present",
+	compare: func(x, y *summaryRecord) int {
+		return compare(x.present, y.present)
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, fmt.Sprintf("%d", x.present))
+	},
+	copyField: copyFieldNop,
+}
+
+var byInputs = &key{
+	name: "inputs",
+	compare: func(x, y *summaryRecord) int {
+		return compare(x.inputs, y.inputs)
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, fmt.Sprintf("%d", x.inputs))
+	},
+	copyField: copyFieldNop,
+}
+
+// Quality is present/inputs.
+var byQuality = &key{
+	name: "quality",
+	compare: func(x, y *summaryRecord) int {
+		if x.inputs == 0 && y.inputs != 0 {
+			return -1
+		}
+		if y.inputs == 0 && x.inputs != 0 {
+			return 1
+		}
+		if x.inputs == 0 && y.inputs == 0 {
+			return 0
+		}
+		qx := float64(x.present) / float64(x.inputs)
+		qy := float64(y.present) / float64(y.inputs)
+		if qx < qy {
+			return -1
+		}
+		if qx > qy {
+			return 1
+		}
+		return 0
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, fmt.Sprintf("%.2f", float64(x.present)/float64(x.inputs)))
+	},
+	copyField: copyFieldNop,
+}
+
+// Badness is inputs - present.
+var byBadness = &key{
+	name: "badness",
+	compare: func(x, y *summaryRecord) int {
+		qx := x.inputs - x.present
+		qy := y.inputs - y.present
+		if qx < qy {
+			return -1
+		}
+		if qx > qy {
+			return 1
+		}
+		return 0
+	},
+	appendString: func(x *summaryRecord, s []string) []string {
+		return append(s, fmt.Sprintf("%d", x.inputs-x.present))
+	},
+	copyField: copyFieldNop,
+}
+
+var orderMap = map[string]*key{
+	"badness": byBadness,
+	"quality": byQuality,
+	"inputs":   byInputs,
+	"present": byPresent,
+	"line":    byLine,
+	"var":     byVar,
+	"func":    byFunc,
+	"file":    byFile,
+}
+
+type keySlice struct {
+	expected string
+	keys     []*key
+}
+
+func (ks *keySlice) String() string {
+	r := "["
+	sep := ""
+	for _, s := range ks.keys {
+		r = r + sep + s.String()
+		sep = ", "
+	}
+	r += "]"
+	return r
+
+}
+func (ks *keySlice) Set(s string) error {
+	ks.keys = ks.keys[:0]
+	ss := strings.Split(s, ",")
+	for _, s := range ss {
+		k, ok := orderMap[s]
+		if !ok || !strings.Contains(ks.expected, s) {
+			return fmt.Errorf("Expected some of {%s} but saw %s instead", ks.expected, s)
+		}
+		// Prevent duplicates (these lists are short, no need for cleverness)
+		for _, kk := range ks.keys {
+			if k == kk {
+				k = nil
+				break
+			}
+		}
+		if k != nil {
+			ks.keys = append(ks.keys, k)
+		}
+	}
+	return nil
+}
+
+func (ks *keySlice) IsBoolFlag() bool {
+	return false
 }
 
 func main() {
@@ -181,127 +333,13 @@ func main() {
 	var funcs []*regexp.Regexp
 	var vars []*regexp.Regexp
 
-	var byFile = key{
-		name: "by file",
-		compare: func(x, y *summaryRecord) int {
-			return strings.Compare(x.byFile, y.byFile)
-		},
-		appendString: func(x *summaryRecord, s []string) []string {
-			return append(s, x.byFile)
-		},
-		copyField: func(from, to *summaryKey) {
-			to.byFile = from.byFile
-		},
-	}
-	var byFunc = key{
-		name: "by func",
-		compare: func(x, y *summaryRecord) int {
-			return strings.Compare(x.byFunc, y.byFunc)
-		},
-		appendString: func(x *summaryRecord, s []string) []string {
-			return append(s, x.byFunc)
-		},
-		copyField: func(from, to *summaryKey) {
-			to.byFunc = from.byFunc
-		},
-	}
-	var byVar = key{
-		name: "by var",
-		compare: func(x, y *summaryRecord) int {
-			return strings.Compare(x.byVar, y.byVar)
-		},
-		appendString: func(x *summaryRecord, s []string) []string {
-			return append(s, x.byVar)
-		},
-		copyField: func(from, to *summaryKey) {
-			to.byVar = from.byVar
-		},
-	}
-	var byLine = key{
-		name: "by line",
-		compare: func(x, y *summaryRecord) int {
-			return compare(x.byLine, y.byLine)
-		},
-		appendString: func(x *summaryRecord, s []string) []string {
-			return s
-		},
-		copyField: func(from, to *summaryKey) {
-		},
-	}
-
-	var byPresent = key{
-		name: "by present",
-		compare: func(x, y *summaryRecord) int {
-			return compare(x.present, y.present)
-		},
-		appendString: appendStringNop,
-		copyField:    copyFieldNop,
-	}
-
-	var byTotal = key{
-		name: "by total",
-		compare: func(x, y *summaryRecord) int {
-			return compare(x.total, y.total)
-		},
-		appendString: appendStringNop,
-		copyField:    copyFieldNop,
-	}
-
-	// Quality is present/total.
-	var byQuality = key{
-		name: "by quality",
-		compare: func(x, y *summaryRecord) int {
-			if x.total == 0 && y.total != 0 {
-				return -1
-			}
-			if y.total == 0 && x.total != 0 {
-				return 1
-			}
-			if x.total == 0 && y.total == 0 {
-				return 0
-			}
-			qx := float64(x.present) / float64(x.total)
-			qy := float64(y.present) / float64(y.total)
-			if qx < qy {
-				return -1
-			}
-			if qx > qy {
-				return 1
-			}
-			return 0
-		},
-		appendString: appendStringNop,
-		copyField:    copyFieldNop,
-	}
-
-	// Badness is total - present.
-	var byBadness = key{
-		name: "by badness",
-		compare: func(x, y *summaryRecord) int {
-			qx := x.total - x.present
-			qy := y.total - y.present
-			if qx < qy {
-				return -1
-			}
-			if qx > qy {
-				return 1
-			}
-			return 0
-		},
-		appendString: appendStringNop,
-		copyField:    copyFieldNop,
-	}
+	orders := &keySlice{expected: "file,func,line,var,inputs,present,quality,badness", keys: []*key{byFile, byVar}}
+	splits := &keySlice{expected: "file,func,line,var"}
 
 	flag.BoolVar(&debug, "debug", debug, "Emit (this program's) debugging output to stderr")
-	flag.Var(&byFile, "byfile", "Split summary and sort by file")
-	flag.Var(&byFunc, "byfunc", "Split summary and sort by functions")
-	flag.Var(&byVar, "byvar", "Split summary and sort by variables")
-	flag.Var(&byLine, "byline", "Split summary and sort by lines")
-	flag.Var(&byPresent, "bypresent", "Sort by how many inputs are present")
-	flag.Var(&byTotal, "bytotal", "Sort by total number of inputs")
-	flag.Var(&byQuality, "byquality", "Sort by present/total")
-	flag.Var(&byBadness, "bybadness", "Sort by total-present")
 
+	flag.Var(orders, "order", "Keys for sorting output")
+	flag.Var(splits, "split", "Separate output by these categories")
 	flag.Var((*regexps)(&files), "file", "Limit scan to files (pathnames) matching regexp (may be repeated)")
 	flag.Var((*regexps)(&funcs), "func", "Limit scan to functions matching regexp (may be repeated)")
 	flag.Var((*regexps)(&vars), "var", "Limit scan to variables matching regexp (may be repeated)")
@@ -312,27 +350,35 @@ func main() {
 		fmt.Fprintf(os.Stderr, `
 For a binary, %s reports the number of local-variable inputs to lines
 that are present at that line's PC(s) in the debugging information,
-and for each summary line prints #inputs, #present, #present/#inputs.
-With no -byX options, it prints a single summary line, otherwise the
-output is split and sorted as specified (for sorting, parameter -byX
-parameter order matters).
+and for each summary line prints 
+   #inputs, #present, #present/#inputs,  #inputs-#present
+The ratio is "quality", the difference is "badness"
+
+With no -split option, it prints a single summary line, otherwise the
+output is split and sorted as specified.
 
 Example:
- go tool -n compile | xargs ./dwarf-goodness \
-    -file=ssa/compile/internal/ssa \
-    -bybadness -bytotal -byfile -byvar
+    ./dwarf-goodness \
+    -file strings -file math \
+    -order=badness,inputs,file,var \
+    -split=file,var \
+    $( which go $)
 
-This will report the files and variables in the ssa portion
-of the Go compiler, sorted by increasing badness (then total,
-then file, then variable).
-
-(There are still bugs in this reporting.)
+This will report, for the Go command binary, the files whose names
+contain "strings" or "math", and the variables in those files, sorted
+by increasing badness (then by inputs, then by file, then by variable).
 `, os.Args[0])
 	}
 
 	flag.Parse()
+	if len(flag.Args()) == 0 {
 
-	doit(flag.Arg(0), debug, keys, files, funcs, vars)
+		flag.Usage()
+		fmt.Fprintf(os.Stderr, "\nNo input file was provided.\n")
+		return
+	}
+
+	doit(flag.Arg(0), debug, splits.keys, orders.keys, files, funcs, vars)
 }
 
 func skip(name string, res []*regexp.Regexp) bool {
@@ -347,11 +393,11 @@ func skip(name string, res []*regexp.Regexp) bool {
 	return true
 }
 
-// doit analyzes binaryName for "DWARF 	quality".
-// analysis is limited to the files/funcs/varts matching at least one of their respective slices of regular expressions,
-// and the report is split and sorted (or for results, just sorted) according to the ordered keys.
+// doit analyzes binaryName for "DWARF 	quality" and prints a result in CSV to standard output.
+// Analysis is limited to the files/funcs/vars matching at least one of their respective slices of regular expressions,
+// and the report is split and sorted (or for results, just sorted) according to split and order.
 // If debug is true, progress reports and perhaps debugging information appear on standard error.
-func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*regexp.Regexp) {
+func doit(binaryName string, debug bool, split []*key, order []*key, files, funcs, vars []*regexp.Regexp) {
 	var file0 string
 
 	bi := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
@@ -386,7 +432,7 @@ func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*rege
 			_, _ = fmt.Fprintf(os.Stderr, "\n")
 		}
 		input2Lines := getFile(bi, file, skipVar)
-		if input2Lines.m == nil {
+		if input2Lines == nil {
 			_, _ = fmt.Fprintf(os.Stderr, "Couldn't read source file %s\n", file)
 			continue
 		}
@@ -432,7 +478,7 @@ func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*rege
 			}
 			seen[name] = true
 
-			pclns := input2Lines.m[i2lkey{file: file, variable: name}]
+			pclns := input2Lines[fileAndVar{file: file, variable: name}]
 			if len(pclns) == 0 {
 				continue
 			}
@@ -484,16 +530,16 @@ func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*rege
 	var total summaryRecord
 	for fname, slmap := range fileCache {
 
-		for vname, pclns := range slmap.m {
+		for vname, pclns := range slmap {
 			for _, pcln := range pclns {
 				key0 := &summaryKey{byVar: vname.variable, byFile: fname, byFunc: pcln.funcName, byLine: pcln.line}
 				key := summaryKey{}
-				for _, k := range keys {
+				for _, k := range split {
 					k.copyField(key0, &key)
 				}
 				value := summary[key]
-				value.total++
-				total.total++
+				value.inputs++
+				total.inputs++
 				if pcln.present {
 					value.present++
 					total.present++
@@ -513,7 +559,7 @@ func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*rege
 		oi := &ordered[i]
 		oj := &ordered[j]
 
-		for _, k := range keys {
+		for _, k := range order {
 			c := k.compare(oi, oj)
 			if c != 0 {
 				return c < 0
@@ -523,26 +569,21 @@ func doit(binaryName string, debug bool, keys []*key, files, funcs, vars []*rege
 	})
 
 	csvw := csv.NewWriter(os.Stdout)
-
-	describe := func(s []string, record summaryRecord) {
-		s = append(s, fmt.Sprintf("%d", record.total))
-		s = append(s, fmt.Sprintf("%d", record.present))
-		s = append(s, fmt.Sprintf("%f", float64(record.present)/float64(record.total)))
-		csvw.Write(s)
-	}
-
+	fields := append(split, []*key{byInputs, byPresent, byQuality, byBadness}...)
 	n := 0
 	for _, record := range ordered {
 		var s []string
-		for _, k := range keys {
+		for _, k := range fields {
 			s = k.appendString(&record, s)
 		}
 		n++
-		describe(s, record)
-	}
-	if n > 1 {
-		describe([]string{"total"}, total)
+		must(csvw.Write(s))
 	}
 	csvw.Flush()
+	if len(ordered) > 1 {
+		commas := ",,,,,,,,,,"
+		commas = commas[0:len(split)]
+		fmt.Printf("Total%s%d,%d,%.2f,%d\n", commas, total.inputs, total.present, float64(total.present)/float64(total.inputs), total.inputs-total.present)
+	}
 
 }
