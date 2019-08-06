@@ -52,7 +52,7 @@ type summaryKey struct {
 
 type summaryValue struct {
 	present int
-	inputs   int
+	inputs  int
 }
 
 type summaryRecord struct {
@@ -66,9 +66,10 @@ type fileAndVar struct {
 }
 
 type sortedLineMap map[fileAndVar][]*pcln
+
 var fileCache = make(map[string]sortedLineMap)
 
-func getFile(bi *proc.BinaryInfo, path string, skipVar func(name string) bool) sortedLineMap {
+func getFile(bi *proc.BinaryInfo, path string, skipVar func(name string) bool, debug bool) sortedLineMap {
 	if r, cached := fileCache[path]; cached {
 		return r
 	}
@@ -87,8 +88,12 @@ func getFile(bi *proc.BinaryInfo, path string, skipVar func(name string) bool) s
 				}
 				k.variable = input
 				pclns := input2Lines[k]
-				pclns = append(pclns, &pcln{fileName: path, line: line, varName: input, pc: pc})
+				x := pcln{fileName: path, line: line, varName: input, pc: pc}
+				pclns = append(pclns, &x)
 				input2Lines[k] = pclns
+				if debug {
+					_, _ = fmt.Fprintf(os.Stderr, "PCLN file=%s, var=%s, line=%d, pc=0x%x\n", x.fileName, x.varName, x.line, x.pc)
+				}
 			}
 		}
 	}
@@ -276,7 +281,7 @@ var byBadness = &key{
 var orderMap = map[string]*key{
 	"badness": byBadness,
 	"quality": byQuality,
-	"inputs":   byInputs,
+	"inputs":  byInputs,
 	"present": byPresent,
 	"line":    byLine,
 	"var":     byVar,
@@ -364,9 +369,10 @@ Example:
     -split=file,var \
     $( which go $)
 
-This will report, for the Go command binary, the files whose names
+This will report, for the Go command binary, the files whose path names
 contain "strings" or "math", and the variables in those files, sorted
 by increasing badness (then by inputs, then by file, then by variable).
+
 `, os.Args[0])
 	}
 
@@ -381,6 +387,8 @@ by increasing badness (then by inputs, then by file, then by variable).
 	doit(flag.Arg(0), debug, splits.keys, orders.keys, files, funcs, vars)
 }
 
+// skip returns whether a name should be skipped, based on its membership in
+// any regular expression in res.
 func skip(name string, res []*regexp.Regexp) bool {
 	if len(res) == 0 {
 		return false
@@ -393,7 +401,7 @@ func skip(name string, res []*regexp.Regexp) bool {
 	return true
 }
 
-// doit analyzes binaryName for "DWARF 	quality" and prints a result in CSV to standard output.
+// doit analyzes binaryName for "DWARF quality" and prints a result in CSV to standard output.
 // Analysis is limited to the files/funcs/vars matching at least one of their respective slices of regular expressions,
 // and the report is split and sorted (or for results, just sorted) according to split and order.
 // If debug is true, progress reports and perhaps debugging information appear on standard error.
@@ -431,7 +439,7 @@ func doit(binaryName string, debug bool, split []*key, order []*key, files, func
 		if file != file0 && debug {
 			_, _ = fmt.Fprintf(os.Stderr, "\n")
 		}
-		input2Lines := getFile(bi, file, skipVar)
+		input2Lines := getFile(bi, file, skipVar, debug)
 		if input2Lines == nil {
 			_, _ = fmt.Fprintf(os.Stderr, "Couldn't read source file %s\n", file)
 			continue
@@ -529,7 +537,6 @@ func doit(binaryName string, debug bool, split []*key, order []*key, files, func
 	// Summarize the contents of the file Cache
 	var total summaryRecord
 	for fname, slmap := range fileCache {
-
 		for vname, pclns := range slmap {
 			for _, pcln := range pclns {
 				key0 := &summaryKey{byVar: vname.variable, byFile: fname, byFunc: pcln.funcName, byLine: pcln.line}
@@ -581,7 +588,7 @@ func doit(binaryName string, debug bool, split []*key, order []*key, files, func
 	}
 	csvw.Flush()
 	if len(ordered) > 1 {
-		commas := ",,,,,,,,,,"
+		commas := ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
 		commas = commas[0:len(split)]
 		fmt.Printf("Total%s%d,%d,%.2f,%d\n", commas, total.inputs, total.present, float64(total.present)/float64(total.inputs), total.inputs-total.present)
 	}
