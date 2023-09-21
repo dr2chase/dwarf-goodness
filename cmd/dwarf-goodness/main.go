@@ -26,7 +26,6 @@ func must(err error) {
 		panic(err)
 	}
 }
-
 // unsafe-punned to get access to private data from delve.
 type Function struct {
 	Name       string
@@ -271,7 +270,7 @@ var byQuality = &key{
 		return 0
 	},
 	appendString: func(x *summaryRecord, s []string) []string {
-		return append(s, fmt.Sprintf("%.2f", float64(x.Present)/float64(x.inputs)))
+		return append(s, fmt.Sprintf("%.4f", float64(x.Present)/float64(x.inputs)))
 	},
 	copyField: copyFieldNop,
 }
